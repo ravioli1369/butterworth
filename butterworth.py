@@ -2,12 +2,10 @@ import torch
 import torchaudio
 from ml4gw.constants import PI
 import numpy as np
-import matplotlib.pyplot as plt
-from scipy.signal import butter, filtfilt
 from torchaudio.functional import filtfilt as torchaudio_filtfilt
 
 
-def buttap(N):
+def _buttap(N):
     """Return (z,p,k) for analog prototype of Nth-order Butterworth filter.
 
     The filter will have an angular (e.g., rad/s) cutoff frequency of 1.
@@ -31,10 +29,7 @@ def _relative_degree(z, p):
     """
     Return relative degree of transfer function from zeros and poles
     """
-    if (len(p.shape) > 1) and (len(z.shape) > 1):
-        degree = p.shape[1] - z.shape[1]
-    else:
-        degree = len(p) - len(z)
+    degree = len(p) - len(z)
     if degree < 0:
         raise ValueError(
             "Improper transfer function. "
@@ -47,6 +42,7 @@ def _relative_degree(z, p):
 def lp2lp_zpk(z, p, k, wo=1.0):
     z = torch.atleast_1d(z)
     p = torch.atleast_1d(p)
+    wo = float(wo)  # Avoid int wraparound
 
     degree = _relative_degree(z, p)
 
@@ -124,6 +120,8 @@ def lp2bp_zpk(z, p, k, wo=1.0, bw=1.0):
 def lp2bs_zpk(z, p, k, wo=1.0, bw=1.0):
     z = torch.atleast_1d(z)
     p = torch.atleast_1d(p)
+    wo = float(wo)
+    bw = float(bw)
 
     degree = _relative_degree(z, p)
 
@@ -132,8 +130,8 @@ def lp2bs_zpk(z, p, k, wo=1.0, bw=1.0):
     p_hp = (bw / 2) / p
 
     # Square root needs to produce complex result, not NaN
-    z_hp = z_hp.astype(torch.complex128)
-    p_hp = p_hp.astype(torch.complex128)
+    z_hp = z_hp.astype(complex)
+    p_hp = p_hp.astype(complex)
 
     # Duplicate poles and zeros and shift from baseband to +wo and -wo
     z_bs = torch.concatenate(
@@ -169,16 +167,17 @@ def _validate_fs(fs, allow_none=True):
     if fs is None:
         if not allow_none:
             raise ValueError("Sampling frequency can not be none.")
-    # else:  # should be float
-    # if size(fs) != 1:
-    #     raise ValueError("Sampling frequency fs must be a single scalar.")
-    # fs = float(fs)
+    else:  # should be float
+        if size(fs) != 1:
+            raise ValueError("Sampling frequency fs must be a single scalar.")
+        fs = float(fs)
     return fs
 
 
 def bilinear_zpk(z, p, k, fs):
     z = torch.atleast_1d(z)
     p = torch.atleast_1d(p)
+
     fs = _validate_fs(fs, allow_none=False)
 
     degree = _relative_degree(z, p)
@@ -190,7 +189,6 @@ def bilinear_zpk(z, p, k, fs):
     p_z = (fs2 + p) / (fs2 - p)
 
     # Any zeros that were at infinity get moved to the Nyquist frequency
-    breakpoint()
     z_z = torch.cat((z_z, -torch.ones(degree)))
 
     # Compensate for gain change
@@ -204,7 +202,7 @@ def zpk2tf(z, p, k):
     k = torch.atleast_1d(k)
     if len(z.shape) > 1:
         temp = poly(z[0])
-        b = torch.empty((z.shape[0], z.shape[1] + 1), dtype=temp.dtype)
+        b = torch.empty((z.shape[0], z.shape[1] + 1), temp.dtype.char)
         if len(k) == 1:
             k = [k[0]] * z.shape[0]
         for i in range(z.shape[0]):
@@ -212,7 +210,7 @@ def zpk2tf(z, p, k):
     else:
         b = k * poly(z)
     a = torch.atleast_1d(poly(p))
-
+    a, b = a.real, b.real
     return b, a
 
 
@@ -220,9 +218,9 @@ def size(t):
     try:
         shape = t.shape
         if type(shape) == torch.Size:
-            return torch.tensor(shape)[0].item()
+            return torch.prod(torch.tensor(shape)).item()
         else:
-            return shape[0]
+            return np.prod(shape)
     except AttributeError:
         return 1
 
@@ -234,24 +232,17 @@ def poly(seq):
     seq = torch.atleast_1d(seq)
     if len(seq) == 0:
         return torch.tensor([1.0], dtype=torch.float64)
-    elif len(seq.shape) == 1:
-        one = torch.ones(1, dtype=torch.complex128)
-        seq = seq.unsqueeze(1)
-        p = torch.cat((one, -seq[0]))
-        for s in seq[1:]:
-            p = torchaudio.functional.convolve(p, torch.cat((one, -s)))
-        return p
     else:
-        one = torch.ones(seq.shape[0], 1, dtype=torch.complex128)
-        seq = seq.unsqueeze(0).T
-        p = torch.cat((one, -seq[0]), dim=1)
+        p = torch.tensor([1.0, -seq[0]], dtype=torch.complex128)
         for s in seq[1:]:
-            p = torchaudio.functional.convolve(p, torch.cat((one, -s), dim=1))
+            p = torchaudio.functional.convolve(
+                p, torch.tensor([1.0, -s], dtype=torch.complex128)
+            )
         return p
 
 
 def iirfilter(N, Wn, btype="low", analog=False, fs=None):
-    z, p, k = buttap(N)
+    z, p, k = _buttap(N)
 
     if not analog:
         if torch.any(Wn <= 0) or torch.any(Wn >= 1):
@@ -270,11 +261,11 @@ def iirfilter(N, Wn, btype="low", analog=False, fs=None):
 
     # transform to lowpass, bandpass, highpass, or bandstop
     if btype in ("lowpass", "highpass", "low", "high"):
-        # if size(Wn) != 1:
-        #     raise ValueError(
-        #         "Must specify a single critical frequency Wn "
-        #         "for lowpass or highpass filter"
-        #     )
+        if size(Wn) != 1:
+            raise ValueError(
+                "Must specify a single critical frequency Wn "
+                "for lowpass or highpass filter"
+            )
 
         if btype == "lowpass" or btype == "low":
             z, p, k = lp2lp_zpk(z, p, k, wo=warped)
@@ -299,51 +290,12 @@ def iirfilter(N, Wn, btype="low", analog=False, fs=None):
     # Find discrete equivalent if necessary
     if not analog:
         z, p, k = bilinear_zpk(z, p, k, fs=fs)
-    breakpoint()
+
     # Transform to proper out type (numer-denom)
     return zpk2tf(z, p, k)
 
 
 def butter_filter_torch(data, cutoff, fs, order, btype):
-    nyquist = 0.5 * fs
-    normal_cutoff = cutoff / nyquist
-    b, a = iirfilter(order, normal_cutoff, btype=btype, analog=False, fs=fs)
-    b = b.real
-    a = a.real
+    b, a = iirfilter(order, cutoff, btype=btype, analog=False, fs=fs)
     filtered_data = torchaudio_filtfilt(data, a, b, clamp=False)
     return filtered_data, b, a
-
-
-# Parameters for signal generation
-fs = 1000
-t = np.linspace(0, 1.0, fs, endpoint=False)
-tone_freq = 50
-noise_amplitude = 0.5
-
-
-signal = np.sin(2 * np.pi * tone_freq * t)
-noise = noise_amplitude * np.random.normal(size=t.shape)
-combined_signal = signal + noise
-
-low_cutoff = 100
-high_cutoff = 20
-order = 4
-
-import sys
-
-if sys.argv[1] == "1":
-    lowpass_filtered_torch, b_lp_torch, a_lp_torch = butter_filter_torch(
-        torch.tensor(combined_signal),
-        torch.tensor(low_cutoff),
-        torch.tensor(fs),
-        order,
-        btype="low",
-    )
-else:
-    lowpass_filtered_torch, b_lp_torch, a_lp_torch = butter_filter_torch(
-        torch.tensor(combined_signal).repeat(2, 1),
-        torch.tensor(low_cutoff).repeat(2, 1),
-        torch.tensor(fs).repeat(2, 1),
-        order,
-        btype="low",
-    )
